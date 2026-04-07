@@ -83,7 +83,7 @@ def get_tool_functions(table, client) -> dict[str, Callable[..., list[dict[str, 
         embedder=embedder,
         top_k=20,
         max_context_chars=6000,
-        max_returned_chunks=5,
+        max_returned_chunks=4,
     )
 
     return {
