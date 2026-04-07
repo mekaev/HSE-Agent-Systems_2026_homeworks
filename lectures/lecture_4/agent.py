@@ -81,8 +81,9 @@ def get_tool_functions(table, client) -> dict[str, Callable[..., list[dict[str, 
     retriever = Retriever(
         table=table,
         embedder=embedder,
-        top_k=10,
+        top_k=20,
         max_context_chars=6000,
+        max_returned_chunks=5,
     )
 
     return {
@@ -111,16 +112,11 @@ class RAGAgent:
         retrieve_fn = self.tool_functions.get("retrieve_context")
         if retrieve_fn is None:
             raise ValueError("В tool_functions не найдена функция 'retrieve_context'")
-        return retrieve_fn(question=question, top_k=10, max_context_chars=6000)
+        return retrieve_fn(question=question, top_k=20, max_context_chars=6000)
 
     @staticmethod
     def _build_context(chunks: list[dict[str, Any]]) -> str:
-        parts: list[str] = []
-        for idx, chunk in enumerate(chunks, start=1):
-            parts.append(
-                f"[Фрагмент {idx} | год {chunk['year']}]\n{chunk['text']}"
-            )
-        return "\n\n".join(parts)
+        return Retriever.build_context(chunks)
 
     def _generate_answer(self, question: str, context: str) -> str:
         system_prompt = (

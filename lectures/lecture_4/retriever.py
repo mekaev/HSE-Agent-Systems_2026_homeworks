@@ -16,19 +16,29 @@ class Retriever:
       сначала ищем только по этому году
     - если по фильтру ничего не найдено, делаем fallback
       на обычный поиск без year-filter
+
+    Эксперимент B:
+    - запрашиваем из БД больше кандидатов
+    - exact dedup по тексту
+    - собираем один финальный список чанков
+    - жестко ограничиваем финальный список по max_returned_chunks
+    - бюджет считаем по реальному контексту с оберткой
+    - если текущий чанк не влезает, пробуем следующий
     """
 
     def __init__(
         self,
         table,
         embedder,
-        top_k: int = 10,
+        top_k: int = 20,
         max_context_chars: int = 6000,
+        max_returned_chunks: int = 5,
     ) -> None:
         self.table = table
         self.embedder = embedder
         self.top_k = top_k
         self.max_context_chars = max_context_chars
+        self.max_returned_chunks = max_returned_chunks
 
     @staticmethod
     def _normalize_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -64,10 +74,6 @@ class Retriever:
         year: int,
         limit: int,
     ) -> list[dict[str, Any]]:
-        """
-        Для LanceDB < 0.20 обычно работает .where("year = 2019").
-        Если локальная версия/схема поведет себя иначе, будет fallback.
-        """
         return self.table.search(query_vector).where(f"year = {year}").limit(limit).to_list()
 
     def _search_rows(
@@ -91,6 +97,18 @@ class Retriever:
 
         return self._search_without_filter(query_vector, limit)
 
+    @staticmethod
+    def format_chunk_for_context(chunk: dict[str, Any], idx: int) -> str:
+        return f"[Фрагмент {idx} | год {chunk['year']} | chunk_id={chunk['chunk_id']}]\n{chunk['text']}"
+
+    @classmethod
+    def build_context(cls, chunks: list[dict[str, Any]]) -> str:
+        parts = [
+            cls.format_chunk_for_context(chunk, idx)
+            for idx, chunk in enumerate(chunks, start=1)
+        ]
+        return "\n\n".join(parts)
+
     def retrieve(
         self,
         question: str,
@@ -101,7 +119,11 @@ class Retriever:
         char_limit = max_context_chars if max_context_chars is not None else self.max_context_chars
 
         query_vector = self.embedder.embed_query(question)
-        raw_rows = self._search_rows(query_vector=query_vector, question=question, limit=limit)
+        raw_rows = self._search_rows(
+            query_vector=query_vector,
+            question=question,
+            limit=limit,
+        )
 
         results: list[dict[str, Any]] = []
         seen_texts: set[str] = set()
@@ -116,23 +138,19 @@ class Retriever:
             if text in seen_texts:
                 continue
 
-            next_total = total_chars + len(text)
+            next_idx = len(results) + 1
+            rendered_chunk = self.format_chunk_for_context(row, next_idx)
+            separator_len = 2 if results else 0
+            next_total = total_chars + separator_len + len(rendered_chunk)
+
             if next_total > char_limit:
-                break
+                continue
 
             seen_texts.add(text)
-            total_chars = next_total
             results.append(row)
+            total_chars = next_total
+
+            if len(results) >= self.max_returned_chunks:
+                break
 
         return results
-
-    @staticmethod
-    def build_context(chunks: list[dict[str, Any]]) -> str:
-        parts: list[str] = []
-
-        for idx, chunk in enumerate(chunks, start=1):
-            parts.append(
-                f"[Фрагмент {idx} | year={chunk['year']} | chunk_id={chunk['chunk_id']}]\n{chunk['text']}"
-            )
-
-        return "\n\n".join(parts)
