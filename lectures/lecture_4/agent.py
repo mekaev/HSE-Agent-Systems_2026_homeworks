@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from embedder import DEFAULT_EMBEDDING_MODEL, SimpleEmbedder
 from retriever import Retriever

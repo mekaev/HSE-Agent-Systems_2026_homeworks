@@ -27,7 +27,7 @@ DATASET_DIR = Path("dataset")
 
 
 def extract_year_from_filename(filename: str) -> int:
-    match = re.search(r"(19|20)\d{2}", filename)
+    match = re.search(r"(?<!\d)(?:19|20)\d{2}(?!\d)", filename)
     if not match:
         raise ValueError(f"Не удалось извлечь год из имени файла: {filename}")
     return int(match.group(0))
