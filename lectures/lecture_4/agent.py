@@ -70,10 +70,6 @@ TOOLS_SCHEMA = [
 
 
 def get_tool_functions(table, client) -> dict[str, Callable[..., list[dict[str, Any]]]]:
-    """
-    Ноутбук ожидает эту функцию.
-    Возвращаем не сложный tools-agent, а один retrieval tool.
-    """
     embedder = SimpleEmbedder(
         client=client,
         model=DEFAULT_EMBEDDING_MODEL,
@@ -84,11 +80,11 @@ def get_tool_functions(table, client) -> dict[str, Callable[..., list[dict[str, 
         top_k=20,
         max_context_chars=6000,
         max_returned_chunks=4,
+        llm_client=client,
+        llm_model="openai/gpt-4o-mini",
+        llm_filter_candidates=8,
     )
-
-    return {
-        "retrieve_context": retriever.retrieve,
-    }
+    return {"retrieve_context": retriever.retrieve}
 
 
 class RAGAgent:
