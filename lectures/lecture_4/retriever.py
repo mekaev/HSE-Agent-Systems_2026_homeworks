@@ -6,7 +6,10 @@ from typing import Any
 from rank_bm25 import BM25Okapi
 
 
-YEAR_PATTERN = re.compile(r"\b(2019|2025)\b")
+# Хардкод под текущий датасет (отчёты только 2019 и 2025).
+# Если корпус расширится — заменить на \b(?:19|20)\d{2}\b и валидировать
+# найденный год по списку доступных в БД.
+YEAR_PATTERN = re.compile(r"(?<!\d)(2019|2025)(?!\d)")
 TOKEN_PATTERN = re.compile(r"[\w]+")
 
 
@@ -23,7 +26,7 @@ class Retriever:
     - continue вместо break при упаковке
 
     Эксперимент D:
-    - большие чанки (1500/400), max_returned_chunks=4
+    - большие чанки (1500/400), max_returned_chunks=3
 
     Эксперимент E.3 (dense-anchored BM25 rerank):
     - dense top-N остаётся основой ранжирования
@@ -42,12 +45,18 @@ class Retriever:
         top_k: int = 20,
         max_context_chars: int = 6000,
         max_returned_chunks: int = 4,
+        llm_client: Any = None,
+        llm_model: str | None = None,
+        llm_filter_candidates: int = 8,
     ) -> None:
         self.table = table
         self.embedder = embedder
         self.top_k = top_k
         self.max_context_chars = max_context_chars
         self.max_returned_chunks = max_returned_chunks
+        self.llm_client = llm_client
+        self.llm_model = llm_model
+        self.llm_filter_candidates = llm_filter_candidates
 
     @staticmethod
     def _tokenize(text: str) -> list[str]:
@@ -170,6 +179,105 @@ class Retriever:
         rows_sorted = sorted(rows, key=lambda r: r["_final_score"], reverse=True)
         return rows_sorted
 
+
+    _LLM_FILTER_PROMPT = """Ты — эксперт по отбору документов для RAG-системы.
+
+    Тебе дан вопрос пользователя и {n} фрагментов документов с индексами.
+    Твоя задача — выбрать фрагменты, которые содержат фактические формулировки,
+    пригодные для ответа на вопрос.
+
+    Правила отбора:
+    1. Выбирай фрагмент, если он содержит конкретные данные, цитаты или утверждения,
+    которые прямо отвечают на вопрос (даже частично).
+    2. НЕ выбирай фрагменты, которые просто упоминают тему вопроса без конкретики.
+    3. НЕ выбирай дубликаты: если два фрагмента говорят одно и то же — оставь один.
+    4. Если полезных фрагментов меньше {max_keep} — верни только их.
+    5. Если полезных фрагментов больше {max_keep} — верни {max_keep} самых информативных.
+    6. Если ни один фрагмент не подходит — верни первые {max_keep} по порядку.
+
+    Верни ТОЛЬКО JSON в формате:
+    {{"selected": [индексы через запятую]}}
+
+    Никакого текста до или после JSON.
+
+    ВОПРОС:
+    {question}
+
+    ФРАГМЕНТЫ:
+    {fragments}"""
+
+
+    def _llm_filter(
+        self,
+        question: str,
+        candidates: list[dict[str, Any]],
+        max_keep: int,
+        client: Any,
+        model: str,
+    ) -> list[dict[str, Any]]:
+        """
+        LLM-фильтрация кандидатов. Один вызов на все кандидаты.
+
+        Возвращает подмножество candidates в порядке, выданном LLM.
+        Fallback: при любой ошибке возвращает первые max_keep кандидатов.
+        """
+        import json
+
+        if not candidates:
+            return []
+        if len(candidates) <= max_keep:
+            return candidates
+
+        # Формируем нумерованный список фрагментов
+        fragments_text = "\n\n".join(
+            f"[{idx}] {cand['text'][:800]}"  # обрезаем длинные чанки в промпте
+            for idx, cand in enumerate(candidates)
+        )
+
+        prompt = self._LLM_FILTER_PROMPT.format(
+            n=len(candidates),
+            max_keep=max_keep,
+            question=question,
+            fragments=fragments_text,
+        )
+
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+                response_format={"type": "json_object"},
+            )
+            raw = response.choices[0].message.content or "{}"
+            data = json.loads(raw)
+            selected_indices = data.get("selected", [])
+
+            # Валидация: индексы должны быть int и в диапазоне
+            valid_indices = [
+                int(i) for i in selected_indices
+                if isinstance(i, (int, str)) and str(i).isdigit() and 0 <= int(i) < len(candidates)
+            ]
+
+            if not valid_indices:
+                return candidates[:max_keep]
+
+            # Убираем дубликаты, сохраняя порядок LLM
+            seen: set[int] = set()
+            unique_indices = []
+            for i in valid_indices:
+                if i not in seen:
+                    seen.add(i)
+                    unique_indices.append(i)
+
+            result = [candidates[i] for i in unique_indices[:max_keep]]
+            return result if result else candidates[:max_keep]
+
+        except Exception:
+            # Fallback: берём первые max_keep кандидатов (как без фильтра)
+            return candidates[:max_keep]
+
+
+
     @staticmethod
     def format_chunk_for_context(chunk: dict[str, Any], idx: int) -> str:
         return f"[Фрагмент {idx} | год {chunk['year']} | chunk_id={chunk['chunk_id']}]\n{chunk['text']}"
@@ -205,6 +313,24 @@ class Retriever:
 
         # 3. Dense-anchored BM25 rerank внутри top-N
         reranked_rows = self._rerank_with_bm25_bonus(normalized_rows, question)
+
+        # 3.5 LLM-фильтрация (если включена)
+        if self.llm_client is not None and self.llm_model is not None and reranked_rows:
+            # Берём top-N из BM25-реранка для LLM на вход
+            top_candidates = reranked_rows[:self.llm_filter_candidates]
+            filtered = self._llm_filter(
+                question=question,
+                candidates=top_candidates,
+                max_keep=self.max_returned_chunks,
+                client=self.llm_client,
+                model=self.llm_model,
+            )
+            # LLM уже отдала нужное количество, но для совместимости с упаковщиком
+            # кладём их в начало, оставшиеся как backup (на случай если упаковщик
+            # выбросит кого-то по бюджету)
+            filtered_ids = {id(r) for r in filtered}
+            backup = [r for r in reranked_rows if id(r) not in filtered_ids]
+            reranked_rows = filtered + backup
 
         # 4. Упаковка с дедупом и бюджетом (как в эксперименте B)
         results: list[dict[str, Any]] = []
